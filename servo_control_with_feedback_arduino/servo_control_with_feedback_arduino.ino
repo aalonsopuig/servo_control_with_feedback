@@ -1,206 +1,167 @@
 /*
-===============================================================================
-Title:        servo_control_with_feedback
-Date:         2026-02-27
-Author:       Alejandro Alonso Puig + ChatGPT
-License:      Apache 2.0
--------------------------------------------------------------------------------
-Description:
-Closed-loop experimental servo control with trapezoidal motion profile and
-real feedback measurement.
-
-This version adds dynamic tracking diagnostics:
-- Expected velocity (deg/s)
-- Measured velocity (deg/s)
-- Tracking ratio
-- Simple stall detection logic
-===============================================================================
+  Servo log + load detection (no PWM in log)
+  Author: Alejandro Alonso Puig (https://github.com/aalonsopuig) + ChatGPT 4.1
+  License: Apache-2.0
 */
 
 #include <Arduino.h>
-#include <Servo.h>
+#include <string.h>
+#include <math.h>
 
-// -------------------- USER CONFIGURATION --------------------
-
-#define SERVO_PIN      9
-#define POT_TARGET_PIN A0
-#define POT_VMAX_PIN   A1
-#define POT_ACC_PIN    A2
-#define POT_FB_PIN     A4
-
-#define LOOP_INTERVAL_MS  20
-#define VREF              5.0
-#define ADC_SCALE         1023.0
-
-// HS-805BB calibrated limits
-#define PWM_CENTER_US  1500
-#define PWM_RANGE_US   860
-
-#define PWM_MIN_US     (PWM_CENTER_US - PWM_RANGE_US)
-#define PWM_MAX_US     (PWM_CENTER_US + PWM_RANGE_US)
-
-// Feedback calibration (your measured values)
-#define FB_ADC_0_DEG     91.0
-#define FB_ADC_180_DEG   376.0
-
-#define NUM_SAMPLES      4
-
-// Stall detection thresholds
-#define MIN_EXPECTED_VEL_FOR_TEST   10.0     // deg/s
-#define MIN_REAL_VEL_THRESHOLD      2.0      // deg/s
-#define STALL_CYCLES_REQUIRED       10
-
-// ------------------------------------------------------------
-
-Servo s;
-
-float cmdDeg = 0.0;
-float velocity = 0.0;
-
-float prevMeasuredDeg = 0.0;
-
-int stallCounter = 0;
-
-// -------------------- HELPERS --------------------
-
-float readADCavg(uint8_t pin)
-{
-  long sum = 0;
-  for (int i = 0; i < NUM_SAMPLES; i++)
-    sum += analogRead(pin);
-
-  return (float)sum / NUM_SAMPLES;
+// ---------- Printing helpers (fixed width) ----------
+static void printFloatFixed(float v, uint8_t width, uint8_t prec) {
+  char buf[24];
+  dtostrf(v, width, prec, buf);   // width includes sign and decimal point
+  Serial.print(buf);
 }
 
-float adcToDegCommand(float adc)
-{
-  return (adc / ADC_SCALE) * 180.0;
+static void printIntFixed(long v, uint8_t width) {
+  char buf[16];
+  ltoa(v, buf, 10);
+  int n = (int)strlen(buf);
+  for (int i = 0; i < (int)width - n; i++) Serial.print(' ');
+  Serial.print(buf);
 }
 
-float adcToDegFeedback(float adc)
-{
-  float deg = (adc - FB_ADC_0_DEG) * 180.0 /
-              (FB_ADC_180_DEG - FB_ADC_0_DEG);
+// ---------- Load detection + velocity estimation ----------
+struct LoadMonitorConfig {
+  // Velocity estimation
+  float dt_min_s        = 0.0005f;   // ignore absurdly small dt
+  float ema_alpha_vreal = 0.25f;     // EMA filter for Vreal
 
-  if (deg < 0) deg = 0;
-  if (deg > 180) deg = 180;
+  // "Load" detection (not stall)
+  float vexp_min        = 8.0f;      // deg/s, below this -> not evaluable
+  float err_min         = 4.0f;      // deg, below this -> not evaluable
+  float k_follow        = 0.35f;     // if |Vreal| < k_follow*|Vexp| -> suspect load
+  uint8_t load_count    = 8;         // consecutive hits to declare LOAD
 
-  return deg;
+  // Log decimation (optional): print every N calls
+  uint8_t log_every_n   = 1;         // set to 2..10 if loop is very fast
+};
+
+struct LoadMonitorState {
+  uint32_t t_prev_us = 0;
+  float meas_prev    = 0.0f;
+  float vreal_f      = 0.0f;
+  uint8_t load_cnt   = 0;
+  uint32_t n_calls   = 0;
+};
+
+static void printHeader() {
+  Serial.println(" Target |    Cmd |   Meas |    Err |   Vexp |  VrealF | LIdx | Flag");
 }
 
-int degToPWM(float deg)
-{
-  float us = PWM_MIN_US + (deg / 180.0) * (PWM_MAX_US - PWM_MIN_US);
-  return (int)(us + 0.5);
+// Returns: true if LOAD declared. Also outputs vreal_f and loadIdx.
+static bool updateLoadMonitor(
+  const LoadMonitorConfig& cfg,
+  LoadMonitorState& st,
+  float meas, float vexp, float err,
+  float& out_vreal_f,
+  float& out_loadIdx
+) {
+  uint32_t t_us = micros();
+  float dt = 0.0f;
+
+  if (st.t_prev_us != 0) {
+    uint32_t dtu = t_us - st.t_prev_us;   // unsigned handles overflow correctly
+    dt = (float)dtu * 1e-6f;
+  }
+  st.t_prev_us = t_us;
+
+  float vreal = 0.0f;
+  if (dt > cfg.dt_min_s) {
+    vreal = (meas - st.meas_prev) / dt;   // deg/s if meas is deg
+  }
+  st.meas_prev = meas;
+
+  // EMA filter for Vreal
+  st.vreal_f = cfg.ema_alpha_vreal * vreal + (1.0f - cfg.ema_alpha_vreal) * st.vreal_f;
+
+  // Load criterion
+  float avexp  = fabsf(vexp);
+  float aerr   = fabsf(err);
+  float avreal = fabsf(st.vreal_f);
+
+  if (avexp > cfg.vexp_min && aerr > cfg.err_min) {
+    if (avreal < cfg.k_follow * avexp) {
+      if (st.load_cnt < 255) st.load_cnt++;
+    } else {
+      if (st.load_cnt > 0) st.load_cnt--;
+    }
+  } else {
+    if (st.load_cnt > 0) st.load_cnt--;   // relax slowly when not evaluable
+  }
+
+  bool load = (st.load_cnt >= cfg.load_count);
+
+  // Continuous index 0..1
+  float loadIdx = 0.0f;
+  if (avexp > cfg.vexp_min) {
+    loadIdx = 1.0f - (avreal / (avexp + 1e-3f));
+    if (loadIdx < 0.0f) loadIdx = 0.0f;
+    if (loadIdx > 1.0f) loadIdx = 1.0f;
+  }
+
+  out_vreal_f = st.vreal_f;
+  out_loadIdx = loadIdx;
+  return load;
 }
 
-// ------------------------------------------------------------
+// Call this from your loop with your values (degrees and deg/s recommended)
+static void logServoLine(
+  const LoadMonitorConfig& cfg,
+  LoadMonitorState& st,
+  float target, float cmd, float meas, float vexp, float err
+) {
+  st.n_calls++;
+  if (cfg.log_every_n > 1 && (st.n_calls % cfg.log_every_n) != 0) return;
 
-void setup()
-{
+  float vreal_f = 0.0f;
+  float loadIdx = 0.0f;
+  bool load = updateLoadMonitor(cfg, st, meas, vexp, err, vreal_f, loadIdx);
+
+  // Fixed-width aligned log (no PWM)
+  printFloatFixed(target, 7, 1); Serial.print(" | ");
+  printFloatFixed(cmd,    7, 1); Serial.print(" | ");
+  printFloatFixed(meas,   7, 1); Serial.print(" | ");
+  printFloatFixed(err,    7, 1); Serial.print(" | ");
+  printFloatFixed(vexp,   7, 1); Serial.print(" | ");
+  printFloatFixed(vreal_f,8, 1); Serial.print(" | ");
+  printFloatFixed(loadIdx,5, 2); Serial.print(" | ");
+  Serial.println(load ? "LOAD" : "OK");
+}
+
+// ---------- Example integration ----------
+// Replace these with your real variables / functions.
+static LoadMonitorConfig g_cfg;
+static LoadMonitorState  g_st;
+
+void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(200);
+  printHeader();
 
-  s.attach(SERVO_PIN, PWM_MIN_US, PWM_MAX_US);
-
-  // Initialize from real measured position
-  float adc_fb = readADCavg(POT_FB_PIN);
-  cmdDeg = adcToDegFeedback(adc_fb);
-  prevMeasuredDeg = cmdDeg;
-
-  Serial.println("Target | Cmd | Meas | Err | Vexp | Vreal | Ratio | PWM");
-  Serial.println("----------------------------------------------------------------");
+  // Optional tweaks:
+  // g_cfg.log_every_n = 5;          // if loop is fast, print every 5th call
+  // g_cfg.ema_alpha_vreal = 0.35f;  // more smoothing
+  // g_cfg.vexp_min = 10.0f;
+  // g_cfg.err_min  = 5.0f;
+  // g_cfg.k_follow = 0.30f;
+  // g_cfg.load_count = 10;
 }
 
-// ------------------------------------------------------------
+void loop() {
+  // TODO: replace with your real signals (units consistent)
+  float target = 90.0f;   // desired final position (deg)
+  float cmd    = 80.0f;   // commanded intermediate position (deg)
+  float meas   = 75.0f;   // measured position (deg)
+  float err    = (cmd - meas);  // position error (deg)
 
-void loop()
-{
-  static unsigned long lastTime = millis();
-  unsigned long now = millis();
+  // Example expected velocity (deg/s). Replace with your profile output.
+  // If you don't have vexp, compute it from your trajectory generator, or set it to 0 when not moving.
+  float vexp   = 60.0f;
 
-  if (now - lastTime < LOOP_INTERVAL_MS)
-    return;
+  logServoLine(g_cfg, g_st, target, cmd, meas, vexp, err);
 
-  float dt = (now - lastTime) / 1000.0;
-  lastTime = now;
-
-  // ---- Read user inputs ----
-
-  float targetDeg = adcToDegCommand(readADCavg(POT_TARGET_PIN));
-
-  float vmax = (readADCavg(POT_VMAX_PIN) / ADC_SCALE) * 300.0;     // up to 300 deg/s
-  float acc  = (readADCavg(POT_ACC_PIN) / ADC_SCALE) * 1000.0;     // up to 1000 deg/s²
-
-  // ---- Trapezoidal profile ----
-
-  float distance = targetDeg - cmdDeg;
-  float dir = (distance >= 0) ? 1.0 : -1.0;
-  float absDist = fabs(distance);
-
-  float v_stop = sqrt(2.0 * acc * absDist);
-
-  if (velocity > v_stop)
-    velocity = v_stop;
-
-  velocity += acc * dt;
-  if (velocity > vmax)
-    velocity = vmax;
-
-  float delta = velocity * dt;
-
-  if (delta > absDist)
-    delta = absDist;
-
-  cmdDeg += dir * delta;
-
-  // ---- Send command ----
-
-  int pwm = degToPWM(cmdDeg);
-  s.writeMicroseconds(pwm);
-
-  // ---- Measure real position ----
-
-  float measuredDeg = adcToDegFeedback(readADCavg(POT_FB_PIN));
-
-  float error = cmdDeg - measuredDeg;
-
-  float velReal = (measuredDeg - prevMeasuredDeg) / dt;
-  prevMeasuredDeg = measuredDeg;
-
-  float velExpected = dir * velocity;
-
-  float ratio = 0.0;
-  if (fabs(velExpected) > 1.0)
-    ratio = velReal / velExpected;
-
-  // ---- Stall detection logic ----
-
-  if (fabs(velExpected) > MIN_EXPECTED_VEL_FOR_TEST &&
-      fabs(velReal) < MIN_REAL_VEL_THRESHOLD)
-  {
-    stallCounter++;
-  }
-  else
-  {
-    stallCounter = 0;
-  }
-
-  bool stalled = (stallCounter > STALL_CYCLES_REQUIRED);
-
-  // ---- Print diagnostics ----
-
-  Serial.print(targetDeg, 1); Serial.print(" | ");
-  Serial.print(cmdDeg, 1);    Serial.print(" | ");
-  Serial.print(measuredDeg, 1); Serial.print(" | ");
-  Serial.print(error, 1);     Serial.print(" | ");
-  Serial.print(velExpected, 1); Serial.print(" | ");
-  Serial.print(velReal, 1);   Serial.print(" | ");
-  Serial.print(ratio, 2);     Serial.print(" | ");
-  Serial.print(pwm);
-
-  if (stalled)
-    Serial.print("  STALL");
-
-  Serial.println();
+  delay(20); // just for this demo
 }
