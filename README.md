@@ -1,6 +1,6 @@
-# servo_control_with_feedback
+# servo_control_with_feedback_arduino
 
-This repository contains `servo_control_with_feedback`, an Arduino sketch for **generic servo control with motion shaping** and **real position feedback** read from the servo’s internal potentiometer.
+This repository contains `servo_control_with_feedback_arduino`, an Arduino sketch for **generic servo control with motion shaping** and **real position feedback** read from the servo’s internal potentiometer.
 
 The sketch generates a smooth commanded reference (software motion profile), drives the servo via PWM, reads the internal potentiometer signal through an ADC input, and prints aligned telemetry over USB Serial.
 
